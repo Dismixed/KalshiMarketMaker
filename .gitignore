@@ -5,3 +5,14 @@
 __pycache__/
 
 *.txt
+
+*.csv
+*.json
+
+venv/
+
+.DS_Store
+
+.idea/
+
+.vscode/
