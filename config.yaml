@@ -4,24 +4,39 @@ KXPRESPERSON-28-JVAN_YES:
     trade_side: "yes"              # quote yes & no; bias via inventory
   market_maker:
     max_position: 8                 # small but less constraining than 5
-    order_expiration: 5            # seconds; cancel/replace every cycle anyway
-    gamma: 0.15                     # a bit more risk-averse for jumpy binary
-    k: 2.0                          # deeper book -> smaller ln(1+γ/k) term
+    order_expiration: 20            # seconds; cancel/replace every cycle anyway
+    gamma: 0.001                     # a bit more risk-averse for jumpy binary
+    k: 200.0                   # deeper book -> smaller ln(1+γ/k) term
     T: 28800                        # 8 hours
     min_spread: 0.01                # at least one tick
     position_limit_buffer: 0.2      # start leaning before the cliff
     inventory_skew_factor: 0.01     # noticeably tilt quotes as q grows
   dt: 1.0                            # faster refresh; 2s is fine if API limits
 
-  KXPRESPERSON-28-JVAN_NO:
+SENATEAZ-28-D:
   api:
-    market_ticker: KXPRESPERSON-28-JVAN
+    market_ticker: SENATEAZ-28-D
+    trade_side: "yes"              # quote yes & no; bias via inventory
+  market_maker:
+    max_position: 8                 # small but less constraining than 5
+    order_expiration: 20             # seconds; cancel/replace every cycle anyway
+    gamma: 0.001                     # a bit more risk-averse for jumpy binary
+    k: 200.0                   # deeper book -> smaller ln(1+γ/k) term
+    T: 28800                        # 8 hours
+    min_spread: 0.01                # at least one tick
+    position_limit_buffer: 0.2      # start leaning before the cliff
+    inventory_skew_factor: 0.01     # noticeably tilt quotes as q grows
+  dt: 1.0                            # faster refresh; 2s is fine if API limits
+
+KXPRESNOMD-28-GN:
+  api:
+    market_ticker: KXPRESNOMD-28-GN
     trade_side: "no"              # quote yes & no; bias via inventory
   market_maker:
     max_position: 8                 # small but less constraining than 5
-    order_expiration: 5             # seconds; cancel/replace every cycle anyway
-    gamma: 0.15                     # a bit more risk-averse for jumpy binary
-    k: 2.0                          # deeper book -> smaller ln(1+γ/k) term
+    order_expiration: 20             # seconds; cancel/replace every cycle anyway
+    gamma: 0.001                     # a bit more risk-averse for jumpy binary
+    k: 200.0                   # deeper book -> smaller ln(1+γ/k) term
     T: 28800                        # 8 hours
     min_spread: 0.01                # at least one tick
     position_limit_buffer: 0.2      # start leaning before the cliff

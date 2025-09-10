@@ -2,3 +2,4 @@ requests
 python-dotenv==0.19.1
 PyYAML==6.0
 urllib3 >= 2.1.0, < 3.0.0
+pytest>=7.0

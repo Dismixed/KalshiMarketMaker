@@ -30,7 +30,6 @@ def create_market_maker(mm_config, api, logger, stop_event: threading.Event):
         api=api,
         gamma=mm_config.get('gamma', 0.1),
         k=mm_config.get('k', 1.5),
-        T=mm_config.get('T', 3600),
         max_position=mm_config.get('max_position', 100),
         order_expiration=mm_config.get('order_expiration', 300),
         min_spread=mm_config.get('min_spread', 0.01),
@@ -38,6 +37,7 @@ def create_market_maker(mm_config, api, logger, stop_event: threading.Event):
         inventory_skew_factor=mm_config.get('inventory_skew_factor', 0.01),
         trade_side=mm_config.get('trade_side', 'yes'),
         stop_event=stop_event,
+        T=mm_config.get('T', 3600),
     )
 
 def run_strategy(config_name: str, config: Dict, stop_event: threading.Event):

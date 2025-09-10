@@ -220,6 +220,7 @@ class KalshiTradingAPI(AbstractTradingAPI):
         self.logger.info("Retrieving market data for market ticker: " + self.market_ticker)
         api_response = self.client.get_market(self.market_ticker)
         market_obj = getattr(api_response, "market", None) or {}
+        self.logger.info(f"Market object: {getattr(market_obj, 'close_time', None)}")
         yes_bid = float(market_obj.get("yes_bid") if isinstance(market_obj, dict) else getattr(market_obj, "yes_bid", 0)) / 100
         yes_ask = float(market_obj.get("yes_ask") if isinstance(market_obj, dict) else getattr(market_obj, "yes_ask", 0)) / 100
         no_bid = float(market_obj.get("no_bid") if isinstance(market_obj, dict) else getattr(market_obj, "no_bid", 0)) / 100
@@ -231,7 +232,16 @@ class KalshiTradingAPI(AbstractTradingAPI):
         self.logger.info(f"Current yes mid-market price: ${yes_mid_price:.2f}")
         self.logger.info(f"Current no mid-market price: ${no_mid_price:.2f}")
         return {"yes": yes_mid_price, "no": no_mid_price}
-    
+
+    def get_touch(self) -> float:
+        m = self.api.client.get_market(self.api.market_ticker).market
+        yes_bid = (m["yes_bid"] if isinstance(m, dict) else getattr(m, "yes_bid", 0)) / 100.0
+        yes_ask = (m["yes_ask"] if isinstance(m, dict) else getattr(m, "yes_ask", 0)) / 100.0
+        no_bid  = (m["no_bid"]  if isinstance(m, dict) else getattr(m, "no_bid",  0)) / 100.0
+        no_ask  = (m["no_ask"]  if isinstance(m, dict) else getattr(m, "no_ask",  0)) / 100.0
+        return {"yes": (yes_bid, yes_ask), "no": (no_bid, no_ask)}
+
+
     def get_markets(self) -> List[Dict]:
         self.logger.info("Retrieving markets...")
         try:
@@ -408,7 +418,6 @@ class AvellanedaMarketMaker:
         api: AbstractTradingAPI,
         gamma: float,
         k: float,
-        T: float,
         max_position: int,
         order_expiration: int,
         min_spread: float = 0.01,
@@ -416,7 +425,8 @@ class AvellanedaMarketMaker:
         inventory_skew_factor: float = 0.01,
         trade_side: str = "yes",
         stop_event: Optional[threading.Event] = None,
-        sigma: float = 0.01
+        sigma: float = 0.01,
+        T: float = 0
     ):
         self.api = api
         self.logger = logger
@@ -460,11 +470,10 @@ class AvellanedaMarketMaker:
         sigma = sigma_floor
 
         tau_seconds = 200
-
-
         is_warming_up = True
         secs_to_warm_up = tau_seconds * 3
         secs_in_warm_up = 0
+
 
         if self.metrics is None:
             # derive a friendly name from logger
@@ -512,10 +521,12 @@ class AvellanedaMarketMaker:
             self.logger.info(f"Current mid price for {self.trade_side}: {mid_price:.4f}, Inventory: {inventory}")
 
             reservation_price = self.calculate_reservation_price(mid_price, inventory, current_time)
-            bid_price, ask_price = self.calculate_asymmetric_quotes(mid_price, inventory, current_time)
-            buy_size, sell_size = self.calculate_order_sizes(inventory)
-
             self.logger.info(f"Reservation price: {reservation_price:.4f}")
+            bid_price, ask_price = self.calculate_asymmetric_quotes(mid_price, inventory, current_time)
+            self.logger.info(f"Bid price: {bid_price:.4f}, Ask price: {ask_price:.4f}")
+            buy_size, sell_size = self.calculate_order_sizes(inventory)
+            self.logger.info(f"Buy size: {buy_size}, Sell size: {sell_size}")
+
             self.logger.info(f"Computed desired bid: {bid_price:.4f}, ask: {ask_price:.4f}")
 
             # snapshot
@@ -554,36 +565,45 @@ class AvellanedaMarketMaker:
 
     def calculate_asymmetric_quotes(self, mid_price: float, inventory: int, t: float) -> Tuple[float, float]:
         reservation_price = self.calculate_reservation_price(mid_price, inventory, t)
-        base_spread = self.calculate_optimal_spread(t, inventory)
-        
-        position_ratio = inventory / self.max_position
-        spread_adjustment = base_spread * abs(position_ratio) * 3
-        
+        self.logger.info(f"Reservation price 2: {reservation_price:.4f}")
+        delta = self.calculate_optimal_spread(t, inventory)
+        self.logger.info(f"Delta: {delta:.4f}")
+        position_ratio = min(abs(inventory) / max(1, self.max_position), 1.0)
+        widen_coeff = 0.5
+        spread_adjustment = delta * (position_ratio ** 2) * widen_coeff
+        self.logger.info(f"Spread adjustment: {spread_adjustment:.4f}")
         if inventory > 0:
-            bid_spread = base_spread / 2 + spread_adjustment
-            ask_spread = max(base_spread / 2 - spread_adjustment, self.min_spread / 2)
+            bid_spread = delta + spread_adjustment
+            ask_spread = max(delta - 0.5 * spread_adjustment, 0.5 * self.min_spread)
+            self.logger.info(f"Bid spread: {bid_spread:.4f}, Ask spread: {ask_spread:.4f}")
         else:
-            bid_spread = max(base_spread / 2 - spread_adjustment, self.min_spread / 2)
-            ask_spread = base_spread / 2 + spread_adjustment
-        
+            bid_spread = max(delta - 0.5 * spread_adjustment, 0.5 * self.min_spread)
+            ask_spread = delta + spread_adjustment
+            self.logger.info(f"Bid spread: {bid_spread:.4f}, Ask spread: {ask_spread:.4f}")
         bid_price = max(0, min(mid_price, reservation_price - bid_spread))
         ask_price = min(1, max(mid_price, reservation_price + ask_spread))
-        
+        self.logger.info(f"Bid price 2: {bid_price:.4f}, Ask price 2: {ask_price:.4f}")
         return bid_price, ask_price
 
     def calculate_reservation_price(self, mid_price: float, inventory: int, t: float) -> float:
         dynamic_gamma = self.calculate_dynamic_gamma(inventory)
-        inventory_skew = inventory * self.inventory_skew_factor * mid_price
-        return mid_price + inventory_skew - inventory * dynamic_gamma * (self.sigma**2) * (1 - t/self.T)
+        # inventory_skew = inventory * self.inventory_skew_factor * mid_price
+        # return mid_price + inventory_skew - inventory * dynamic_gamma * (self.sigma**2) * (self.T - t)
+        return mid_price - inventory * dynamic_gamma * (self.sigma**2) * (self.T - t)
 
     def calculate_optimal_spread(self, t: float, inventory: int) -> float:
         dynamic_gamma = self.calculate_dynamic_gamma(inventory)
-        # can add implied volatility here, revisit
-        base_spread = (dynamic_gamma * (self.sigma**2) * (1 - t/self.T) + 
-                       (2 / dynamic_gamma) * math.log(1 + (dynamic_gamma / self.k)))
-        position_ratio = abs(inventory) / self.max_position
-        spread_adjustment = 1 - (position_ratio ** 2)
-        return max(base_spread * spread_adjustment * 0.01, self.min_spread)
+        self.logger.info(f"Dynamic gamma: {dynamic_gamma:.4f}")
+        self.logger.info(f"Sigma: {self.sigma:.4f}")
+        self.logger.info(f"T: {self.T:.4f}")
+        self.logger.info(f"t: {t:.4f}")
+        self.logger.info(f"K: {self.k:.4f}")
+        base_spread = (dynamic_gamma * (self.sigma**2) * (self.T - t) / 2) + (1 / dynamic_gamma) * math.log(1 + (dynamic_gamma / self.k))
+        self.logger.info(f"Base spread: {base_spread:.4f}")
+        # position_ratio = abs(inventory) / self.max_position
+        # spread_adjustment = 1 + (position_ratio ** 2)
+        # return max(base_spread * spread_adjustment * 0.01, self.min_spread)
+        return max(base_spread, self.min_spread / 2.0)  # ensure a floor in same price units
 
     def calculate_dynamic_gamma(self, inventory: int) -> float:
         position_ratio = abs(inventory) / max(1, self.max_position)
