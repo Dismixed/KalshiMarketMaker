@@ -11,6 +11,14 @@ from kalshi_python import Configuration, KalshiClient
 from kalshi_python.models.create_order_request import CreateOrderRequest
 import json
 
+def to_tick(p: float) -> float:
+    # clamp to valid cents 0.01..0.99 and ROUND, not floor
+    p = max(0.01, min(0.99, round(p, 2)))
+    return p
+
+def to_cents(p: float) -> int:
+    return int(round(to_tick(p) * 100))
+
 class MetricsTracker:
     def __init__(self, strategy_name: str, market_ticker: str):
         self.strategy_name = strategy_name
@@ -233,13 +241,16 @@ class KalshiTradingAPI(AbstractTradingAPI):
         self.logger.info(f"Current no mid-market price: ${no_mid_price:.2f}")
         return {"yes": yes_mid_price, "no": no_mid_price}
 
-    def get_touch(self) -> float:
-        m = self.api.client.get_market(self.api.market_ticker).market
-        yes_bid = (m["yes_bid"] if isinstance(m, dict) else getattr(m, "yes_bid", 0)) / 100.0
-        yes_ask = (m["yes_ask"] if isinstance(m, dict) else getattr(m, "yes_ask", 0)) / 100.0
-        no_bid  = (m["no_bid"]  if isinstance(m, dict) else getattr(m, "no_bid",  0)) / 100.0
-        no_ask  = (m["no_ask"]  if isinstance(m, dict) else getattr(m, "no_ask",  0)) / 100.0
-        return {"yes": (yes_bid, yes_ask), "no": (no_bid, no_ask)}
+    def get_touch(self):
+        m = self.client.get_market(self.market_ticker).market
+        def g(obj, k, default=0):
+            return (obj[k] if isinstance(obj, dict) else getattr(obj, k, default)) / 100.0
+        yes_bid, yes_ask = g(m, "yes_bid"), g(m, "yes_ask")
+        no_bid,  no_ask  = g(m, "no_bid"),  g(m, "no_ask")
+        return {"yes": (to_tick(yes_bid) if yes_bid else 0.0,
+                        to_tick(yes_ask) if yes_ask else 0.0),
+                "no":  (to_tick(no_bid)  if no_bid  else 0.0,
+                        to_tick(no_ask)  if no_ask  else 0.0)}
 
 
     def get_markets(self) -> List[Dict]:
@@ -275,6 +286,80 @@ class KalshiTradingAPI(AbstractTradingAPI):
             return markets
         except Exception as e:
             self.logger.error(f"Failed to retrieve markets: {e}")
+            return []
+
+    def get_markets_by_event(self, event_ticker: str, status: str = 'open') -> List[Dict]:
+        self.logger.info(f"Retrieving markets for event {event_ticker}...")
+        markets: List[Dict] = []
+        try:
+            cursor = None
+            while True:
+                try:
+                    api_response = self.client.get_markets(event_ticker=event_ticker, status=status, cursor=cursor)
+                except TypeError:
+                    # SDK may not support event_ticker filter; fall back to fetching and filtering locally
+                    self.logger.warning("SDK get_markets does not accept event_ticker; falling back to local filter")
+                    all_markets = self.get_markets()
+                    filtered: List[Dict] = []
+                    for m in all_markets:
+                        et = m.get('event_ticker') if isinstance(m, dict) else getattr(m, 'event_ticker', None)
+                        if et == event_ticker:
+                            filtered.append(m)
+                    self.logger.info(f"Filtered {len(filtered)} markets for event {event_ticker}")
+                    return filtered
+
+                if not api_response:
+                    break
+
+                current_markets = getattr(api_response, 'markets', None)
+                if current_markets:
+                    if isinstance(current_markets, list):
+                        markets.extend(current_markets)
+                    else:
+                        markets.append(current_markets)
+
+                cursor = getattr(api_response, 'cursor', None)
+                if not cursor:
+                    break
+
+            # Normalize to list of dicts
+            normalized: List[Dict] = []
+            for item in markets:
+                if isinstance(item, dict):
+                    normalized.append(item)
+                    continue
+                to_dict_fn = getattr(item, 'to_dict', None)
+                if callable(to_dict_fn):
+                    try:
+                        normalized.append(to_dict_fn())
+                        continue
+                    except Exception:
+                        pass
+                model_dump_fn = getattr(item, 'model_dump', None)
+                if callable(model_dump_fn):
+                    try:
+                        normalized.append(model_dump_fn(by_alias=True, exclude_none=True))
+                        continue
+                    except Exception:
+                        pass
+                # Fallback minimal fields
+                candidate: Dict = {}
+                for field in [
+                    'ticker', 'event_ticker', 'series_ticker', 'yes_bid', 'yes_ask', 'no_bid', 'no_ask', 'status',
+                ]:
+                    if hasattr(item, field):
+                        candidate[field] = getattr(item, field)
+                normalized.append(candidate)
+
+            self.logger.info(f"Retrieved {len(normalized)} markets for event {event_ticker}")
+            try:
+                with open("markets.json", "w") as f:
+                    json.dump(normalized, f, indent=2, default=str)
+            except Exception:
+                pass
+            return normalized
+        except Exception as e:
+            self.logger.error(f"Failed to retrieve markets for event {event_ticker}: {e}")
             return []
 
     def get_series(self) -> List[Dict]:
@@ -317,7 +402,7 @@ class KalshiTradingAPI(AbstractTradingAPI):
             "client_order_id": str(uuid.uuid4()),
         }
 
-        price_to_send = int(price * 100) # Convert dollars to cents
+        price_to_send = max(1, min(99, int(to_cents(price)))) # Convert dollars to cents
 
         if side == "yes":
             data["yes_price"] = price_to_send
@@ -580,8 +665,8 @@ class AvellanedaMarketMaker:
             bid_spread = max(delta - 0.5 * spread_adjustment, 0.5 * self.min_spread)
             ask_spread = delta + spread_adjustment
             self.logger.info(f"Bid spread: {bid_spread:.4f}, Ask spread: {ask_spread:.4f}")
-        bid_price = max(0, min(mid_price, reservation_price - bid_spread))
-        ask_price = min(1, max(mid_price, reservation_price + ask_spread))
+        bid_price = to_tick(max(0.01, min(mid_price, reservation_price - bid_spread)))
+        ask_price = to_tick(min(0.99, max(mid_price, reservation_price + ask_spread)))
         self.logger.info(f"Bid price 2: {bid_price:.4f}, Ask price 2: {ask_price:.4f}")
         return bid_price, ask_price
 
@@ -658,59 +743,66 @@ class AvellanedaMarketMaker:
         self.handle_order_side('sell', sell_orders, ask_price, sell_size)
 
     def handle_order_side(self, action: str, orders: List[Dict], desired_price: float, desired_size: int):
+        desired_price = to_tick(desired_price)
+        desired_size = max(1, desired_size)
+
+        touch_bid, touch_ask = self.api.get_touch()[self.trade_side]
+        spread = (touch_ask - touch_bid) if (touch_bid and touch_ask) else None
+        self.logger.info(f"Touch {self.trade_side}: bid={touch_bid:.2f} ask={touch_ask:.2f} | target={desired_price:.2f}")
+
+        target = desired_price
+        if action == "buy":
+            # Join best bid at least
+            if touch_bid:
+                target = max(target, touch_bid)
+            # Optional: improve by 1 tick only if there is room (kept simple; you can add conditions)
+            if spread is not None and spread >= 0.02 and touch_ask:
+                target = min(target + 0.01, touch_ask - 0.01)
+        else:  # sell
+            # Join best ask at least
+            if touch_ask:
+                target = min(target, touch_ask)
+            if spread is not None and spread >= 0.02 and touch_bid:
+                target = max(target - 0.01, touch_bid + 0.01)
+
+        target = to_tick(target)
         keep_order = None
         for order in orders:
-            current_price = float(order['yes_price']) / 100 if self.trade_side == 'yes' else float(order['no_price']) / 100
-            if keep_order is None and abs(current_price - desired_price) < 0.01 and order['remaining_count'] == desired_size:
+            px = (float(order["yes_price"]) if self.trade_side == "yes"
+                else float(order["no_price"])) / 100.0
+            px = to_tick(px)
+            if keep_order is None and px == target:
                 keep_order = order
-                self.logger.info(f"Keeping existing {action} order. ID: {order['order_id']}, Price: {current_price:.4f}")
+                self.logger.info(f"Keeping existing {action} at {px:.2f} (order_id={order['order_id']})")
                 if self.metrics:
                     self.metrics.record_action("keep_order", {
-                        "order_id": order['order_id'],
-                        "action": action,
-                        "side": self.trade_side,
-                        "price": round(current_price, 4),
-                        "size": desired_size,
-                    })
+                        "order_id": order["order_id"], "action": action,
+                        "side": self.trade_side, "price": px, "size": order.get("remaining_count","")})
             else:
-                self.logger.info(f"Cancelling extraneous {action} order. ID: {order['order_id']}, Price: {current_price:.4f}")
-                t0 = time.time()
-                self.api.cancel_order(order['order_id'])
-                if self.metrics:
-                    self.metrics.record_latency("cancel_order", time.time() - t0)
-                    self.metrics.record_action("cancel_order", {
-                        "order_id": order['order_id'],
-                        "action": action,
-                        "side": self.trade_side,
-                        "price": round(current_price, 4),
-                        "size": order.get('remaining_count', ''),
-                    })
-
-        current_price = self.api.get_price()[self.trade_side]
-        if keep_order is None:
-            if (action == 'buy' and desired_price < current_price) or (action == 'sell' and desired_price > current_price):
-                try:
+                # Only cancel if price tick differs; keep partials to preserve queue
+                if px != target:
+                    self.logger.info(f"Cancelling {action} at {px:.2f} (want {target:.2f}) id={order['order_id']}")
                     t0 = time.time()
-                    order_id = self.api.place_order(action, self.trade_side, desired_price, desired_size, int(time.time()) + self.order_expiration)
+                    self.api.cancel_order(order["order_id"])
                     if self.metrics:
-                        self.metrics.record_latency("place_order", time.time() - t0)
-                        self.metrics.record_action("place_order", {
-                            "order_id": order_id,
-                            "action": action,
-                            "side": self.trade_side,
-                            "price": round(desired_price, 4),
-                            "size": desired_size,
-                        })
-                    self.logger.info(f"Placed new {action} order. ID: {order_id}, Price: {desired_price:.4f}, Size: {desired_size}")
-                except Exception as e:
-                    self.logger.error(f"Failed to place {action} order: {str(e)}")
-            else:
-                self.logger.info(f"Skipped placing {action} order. Desired price {desired_price:.4f} does not improve on current price {current_price:.4f}")
+                        self.metrics.record_latency("cancel_order", time.time() - t0)
+                        self.metrics.record_action("cancel_order", {
+                            "order_id": order["order_id"], "action": action,
+                            "side": self.trade_side, "price": px, "size": order.get("remaining_count","")})
+
+        # 5) If nothing to keep, PLACE at target tick — no gating on mid or stale current_price
+        if keep_order is None:
+            try:
+                t0 = time.time()
+                order_id = self.api.place_order(
+                    action, self.trade_side, target, desired_size,
+                    int(time.time()) + self.order_expiration
+                )
                 if self.metrics:
-                    self.metrics.record_action("skip_place", {
-                        "action": action,
-                        "side": self.trade_side,
-                        "price": round(desired_price, 4),
-                        "size": desired_size,
-                        "reason": "not_improving_price",
-                    })
+                    self.metrics.record_latency("place_order", time.time() - t0)
+                    self.metrics.record_action("place_order", {
+                        "order_id": order_id, "action": action, "side": self.trade_side,
+                        "price": target, "size": desired_size})
+                self.logger.info(f"Placed {action} {desired_size}@{target:.2f} (order_id={order_id})")
+            except Exception as e:
+                self.logger.error(f"Failed to place {action}: {e}")
